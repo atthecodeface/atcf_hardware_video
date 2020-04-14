@@ -1,0 +1,393 @@
+/** @copyright (C) 2016-2017,  Gavin J Stark.  All rights reserved.
+ *
+ * @copyright
+ *    Licensed under the Apache License, Version 2.0 (the "License");
+ *    you may not use this file except in compliance with the License.
+ *    You may obtain a copy of the License at
+ *     http://www.apache.org/licenses/LICENSE-2.0.
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ *
+ * @file   framebuffer_timing.cdl
+ * @brief  Framebuffer timing module to create sync and display signals
+ *
+ * CDL implementation of a module that takes SRAM writes into a
+ * framebuffer, and includes a mapping to a dual-port SRAM (write on
+ * one side, read on the other), where the video side drives out
+ * vsync, hsync, data enable and pixel data.
+ *
+ */
+/*a Includes */
+include "apb::csr.h"
+include "apb::csr_targets.h"
+include "video.h"
+
+/*
+a Constants */
+constant integer timing_width=12; // Suitable for 2k and lower
+//constant integer timing_width=10; // Not suitable for 1024x768 and higher
+
+/*a Types */
+/*t t_timing */
+typedef bit[timing_width] t_timing;
+
+/*t t_csr_address
+ *
+ * CSR address decode for the framebuffer timing module
+ */
+typedef enum[4] {
+    csr_address_display_size = 0,
+    csr_address_h_porch      = 1,
+    csr_address_v_porch      = 2,
+    csr_address_strobes      = 3,
+} t_csr_address;
+
+/*t t_display_fsm
+ *
+ * State machine states for both horizontal and vertical display
+ */
+typedef fsm {
+    state_back_porch  "During horizontal or vertical back porch, depending on the state machine";
+    state_display     "During the display period for a scanline or frame";
+    state_front_porch "During the period after displayed pixels/scanlines, before the sync starts a new scanline/frame";
+} t_display_fsm;
+
+/*t t_video_combs
+ *
+ * Decode of horizontal and vertical state machines and counters to
+ * determine the next state
+ */
+typedef struct {
+    bit h_line_start;
+    bit h_line_end;
+    bit h_back_porch_end;
+    bit h_display_end;
+    bit h_will_be_displaying;
+    bit h_displaying;
+
+    bit v_frame_start;
+    bit v_back_porch_last_line;
+    bit v_display_last_line;
+    bit v_frame_last_line;
+    bit v_displaying;
+
+    bit will_display_pixels;
+} t_video_combs;
+
+/*t t_video_state
+ *
+ * Video-clock side state of the framebuffer timing module
+ */
+typedef struct {
+    bit h_sync;
+    bit v_sync;
+    bit hs      "Actual strobe output";
+    bit vs      "Actual strobe output";
+    bit display_enable;
+    t_display_fsm h_state;
+    t_timing h_pixel;
+    t_timing hs_counter;
+    t_display_fsm v_state;
+    t_timing v_line;
+    t_timing vs_counter;
+
+    bit pixel_data_required;
+
+} t_video_state;
+
+/*t t_csrs
+ *
+ * Registers to control the timing of the display, written on the CSR clock
+ */
+typedef struct {
+    t_timing h_back_porch      "Number of pixels betwen hsync rising and the first displayed pixel on a scanline";
+    t_timing h_display         "Number of pixels to display per scanline";
+    t_timing h_front_porch     "Number of pixels after displayed pixels before hsync rising on a scanline";
+    t_timing v_back_porch      "Number of scanlines between vsync rising and the first displayed scanline";
+    t_timing v_display         "Number of scanlines to display per frame";
+    t_timing v_front_porch     "Number of scanlines after displayed scanlines before vsync rising in a frame";
+    bit      h_strobe_polarity "If high the hs is active high; if low, then active low";
+    t_timing h_strobe_length   "Number of scanlines to assert hs for";
+    bit      v_strobe_polarity "If high the vs is active high; if low, then active low";
+    t_timing v_strobe_length   "Number of scanlines to assert hs for";
+} t_csrs;
+
+/*a Module
+ */
+module framebuffer_timing( clock csr_clk                      "Clock for CSR reads/writes",
+                           clock video_clk                    "Video clock, used to generate vsync, hsync, data out, etc",
+                           input bit reset_n                  "Active low reset",
+                           output t_video_timing video_timing "Video timing outputs",
+                           input t_csr_request csr_request    "Pipelined CSR request interface to control the module",
+                           output t_csr_response csr_response "Pipelined CSR response interface to control the module",
+                           input bit[16] csr_select           "CSR select value to target this module on the CSR interface"
+    )
+"""
+This module generates v_sync, h_sync and display_enable for a
+framebuffer, using configurable timings. The synchronization signals
+are active for a single cycle, and v_sync is asserted simulationeously
+with h_sync for the start of a frame.
+
+The timing is controlled by three registers: display size, horizontal porches, and vertical porches.
+
+Each line has hsync, porch, display lines, porch; each frame similarly.
+
+The module that uses this must manage the synchronization signals
+required for the particular video standard (the length and polarity of
+synchronization pulses are varied in standards); the timing module
+provides the ability to generate framebuffer addresses and pixels
+reliably, rather than the actual video output synchronization signals.
+
+Display size register:
+
+Bits     | Meaning
+---------|---------
+6;26     | 0
+10;16    | Vertical lines of display -1
+6;10     | 0
+10;0     | Horizontal pixels of display -1
+
+Horizontal porches register:
+
+Bits     | Meaning
+---------|---------
+6;26     | 0
+10;16    | pixels after display prior to hsync -1
+6;10     | 0
+10;0     | pixels including and after hsync -1 prior to display
+
+Vertical porches register:
+
+Bits     | Meaning
+---------|---------
+6;26     | 0
+10;16    | lines after display prior to vsync -1
+6;10     | 0
+10;0     | lines including and after vsync -1 prior to display
+
+
+"""
+{
+    /*b State etc in CSR domain */
+    default reset active_low reset_n;
+    default clock csr_clk;
+    clocked t_csrs csrs = {*=0,
+                           h_back_porch  = 40-1,
+                           h_display     = 480-1, // for 480x272 display
+                           h_front_porch = 5-1,
+                           h_strobe_polarity = 0, // active low
+                           h_strobe_length = 110, // 128 for 64MHz officially, 96 for 25MHz, 110 pixels for strobe worked for VGA monitors and an LCD panel
+                           v_strobe_polarity = 0, // active low
+                           v_strobe_length   = 1, // Standard vsync is one line
+                           v_back_porch  = 8-1,
+                           v_display     = 272-1, // for 480x272 display
+                           v_front_porch = 8-1 }   "Control/status registers";
+    net t_csr_response     csr_response            "Ties the internal @a csr_interface to the output @a csr_response";
+    net t_csr_access       csr_access              "The CSR access decoded by the @a csr_interface, to be handled by this module";
+    comb t_csr_access_data csr_read_data           "Read data in response to the CSR access";
+
+    /*b State in video domain */
+    default reset active_low reset_n;
+    default clock video_clk;
+    clocked t_video_state video_state={*=0}    "State of the video side; timing counters, state machines, and outputs";
+    comb    t_video_combs video_combs          "Combinatorial decode of the @a video_state";
+
+    /*b Video timing logic */
+    video_timing_logic """
+    The video timing logic is effectively a set of counters and comparators.
+
+    A line starts at @a h_pixel 0 in back porch and increments the
+    h_pixel, until the porch is completed when h_pixel is reset; it
+    then goes through the display period until that completes,
+    reseting h_pixel again; then the front porch is performed, at the
+    end of which h_pixel is again reset, and the back porch starts
+    again.
+
+    This method is also used for the vertical timing, with a new line
+    starting when the front porch completes.
+
+    Hence the horizontal and vertical sides have three-state FSMs:
+    back porch, display, front porch. The display is enabled if in the
+    display state for both horizontal and vertical timing machines.
+    """: {
+        /*b Timing decode */
+        video_combs.h_line_start     = video_state.h_sync;
+        video_combs.h_back_porch_end = ((video_state.h_state==state_back_porch)  && (video_state.h_pixel==csrs.h_back_porch));
+        video_combs.h_display_end    = ((video_state.h_state==state_display)     && (video_state.h_pixel==csrs.h_display));
+        video_combs.h_line_end       = ((video_state.h_state==state_front_porch) && (video_state.h_pixel==csrs.h_front_porch));
+        video_combs.h_displaying     = (video_state.h_state==state_display);
+        video_combs.h_will_be_displaying = (video_combs.h_back_porch_end ||
+                                            (video_combs.h_displaying && !video_combs.h_display_end));
+
+        video_combs.v_frame_start       = video_state.v_sync && video_state.h_sync;
+        video_combs.v_back_porch_last_line = ((video_state.v_state==state_back_porch)  && (video_state.v_line==csrs.v_back_porch));
+        video_combs.v_display_last_line    = ((video_state.v_state==state_display)     && (video_state.v_line==csrs.v_display));
+        video_combs.v_frame_last_line      = ((video_state.v_state==state_front_porch) && (video_state.v_line==csrs.v_front_porch));
+        video_combs.v_displaying           = (video_state.v_state==state_display);
+
+        video_combs.will_display_pixels = video_combs.v_displaying && video_combs.h_will_be_displaying;
+
+        /*b Pixel state and pixel data */
+        video_state.display_enable <= 0;
+        if (video_combs.will_display_pixels) {
+            video_state.display_enable <= 1;
+        }
+
+        /*b Horizontal state */
+        video_state.h_pixel <= video_state.h_pixel+1;
+        video_state.h_sync <= 0;
+        full_switch (video_state.h_state) {
+            case state_back_porch: {
+                if (video_combs.h_back_porch_end) {
+                    video_state.h_pixel <= 0;
+                    video_state.h_state <= state_display;
+                }
+            }
+            case state_display: {
+                if (video_combs.h_display_end) {
+                    video_state.h_pixel <= 0;
+                    video_state.h_state <= state_front_porch;
+                    video_state.pixel_data_required <= 0;
+                }
+            }
+            case state_front_porch: {
+                if (video_combs.h_line_end) {
+                    video_state.h_pixel <= 0;
+                    video_state.h_state <= state_back_porch;
+                    video_state.h_sync <= 1;
+                    video_state.pixel_data_required <= (video_combs.v_back_porch_last_line ||
+                                                        (video_combs.v_displaying && !video_combs.v_display_last_line));
+                }
+            }
+        }
+
+        /*b Vertical state */
+        video_state.v_line <= video_state.v_line+1;
+        video_state.v_sync <= 0;
+        full_switch (video_state.v_state) {
+            case state_back_porch: {
+                if (video_combs.v_back_porch_last_line) {
+                    video_state.v_line <= 0;
+                    video_state.v_state <= state_display;
+                }
+            }
+            case state_display: {
+                if (video_combs.v_display_last_line) {
+                    video_state.v_line <= 0;
+                    video_state.v_state <= state_front_porch;
+                }
+            }
+            case state_front_porch: {
+                if (video_combs.v_frame_last_line) {
+                    video_state.v_line <= 0;
+                    video_state.v_state <= state_back_porch;
+                    video_state.v_sync <= 1;
+                }
+            }
+        }
+        if (!video_combs.h_line_end) {
+            video_state.v_sync  <= video_state.v_sync;
+            video_state.v_line  <= video_state.v_line;
+            video_state.v_state <= video_state.v_state;
+        }
+
+        /*b Strobe signals */
+        video_state.hs <= 1;
+        if (video_state.hs_counter!=0) {
+            video_state.hs <= 0;
+            video_state.hs_counter <= video_state.hs_counter-1;
+        }
+        if (video_state.h_sync) {
+            video_state.hs <= 0;
+            video_state.hs_counter <= csrs.h_strobe_length;
+            video_state.vs <= 1;
+            if (video_state.vs_counter!=0) {
+                video_state.vs <= 0;
+                video_state.vs_counter <= video_state.vs_counter-1;
+            }
+        }
+        if (video_state.v_sync) {
+            video_state.vs <= 0;
+            video_state.vs_counter <= csrs.v_strobe_length;
+        }
+        
+        /*b All done */
+    }
+
+    /*b Video timings out */
+    video_timings_out """
+    Drive the video timings out from the @a video_state to the @a video_timing port
+    """ : {
+        video_timing.v_sync              = video_state.v_sync;
+        video_timing.vs                  = video_state.vs ^ csrs.v_strobe_polarity;
+        video_timing.h_sync              = video_state.h_sync;
+        video_timing.hs                  = video_state.hs ^ csrs.h_strobe_polarity;
+        video_timing.will_h_sync         = video_combs.h_line_end;
+        video_timing.v_displaying        = video_combs.v_displaying;
+        video_timing.display_required    = video_state.pixel_data_required;
+        video_timing.display_enable      = video_state.display_enable;
+        video_timing.will_display_enable = video_combs.will_display_pixels;
+        video_timing.v_frame_last_line   = video_combs.v_frame_last_line;
+    }
+    
+    /*b CSR interface */
+    csr_interface_logic """
+    Logic to handle read/write of the timing CSRs through the
+    pipelined CSR interface. @a csr_read_data is driven without caring
+    about @a csr_access.valid, as the CSR interface will discard any
+    data it does not use.
+    """: {
+        csr_target_csr csri( clk <- csr_clk,
+                                reset_n <= reset_n,
+                                csr_request <= csr_request,
+                                csr_response => csr_response,
+                                csr_access => csr_access,
+                                csr_access_data <= csr_read_data,
+                                csr_select <= csr_select );
+        csrs <= csrs;
+        csr_read_data = 0;
+        part_switch (csr_access.address[4;0]) {
+        case csr_address_display_size: {
+            csr_read_data[timing_width;  0] = csrs.h_display;
+            csr_read_data[timing_width; 16] = csrs.v_display;
+            if (csr_access.valid && !csr_access.read_not_write) {
+                csrs.h_display   <= csr_access.data[timing_width;0];
+                csrs.v_display   <= csr_access.data[timing_width;16];
+            }
+        }
+        case csr_address_strobes: {
+            csr_read_data[timing_width;  0] = csrs.h_strobe_length;
+            csr_read_data[15] = csrs.h_strobe_polarity;
+            csr_read_data[timing_width; 16] = csrs.v_strobe_length;
+            csr_read_data[31] = csrs.v_strobe_polarity;
+            if (csr_access.valid && !csr_access.read_not_write) {
+                csrs.v_strobe_polarity  <= csr_access.data[31];
+                csrs.v_strobe_length    <= csr_access.data[timing_width;16];
+                csrs.h_strobe_polarity  <= csr_access.data[15];
+                csrs.h_strobe_length    <= csr_access.data[timing_width;0];
+            }
+        }
+        case csr_address_h_porch: {
+            csr_read_data[timing_width;  0] = csrs.h_back_porch;
+            csr_read_data[timing_width; 16] = csrs.h_front_porch;
+            if (csr_access.valid && !csr_access.read_not_write) {
+                csrs.h_back_porch   <= csr_access.data[timing_width;0];
+                csrs.h_front_porch  <= csr_access.data[timing_width;16];
+            }
+        }
+        case csr_address_v_porch: {
+            csr_read_data[timing_width;  0] = csrs.v_back_porch;
+            csr_read_data[timing_width; 16] = csrs.v_front_porch;
+            if (csr_access.valid && !csr_access.read_not_write) {
+                csrs.v_back_porch   <= csr_access.data[timing_width;0];
+                csrs.v_front_porch  <= csr_access.data[timing_width;16];
+            }
+        }
+        }
+    }
+
+    /*b All done */
+}

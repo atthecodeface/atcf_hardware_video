@@ -1,0 +1,385 @@
+/** Copyright (C) 2016-2017,  Gavin J Stark.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * @file   framebuffer_teletext.cdl
+ * @brief  Teletext framebuffer module with separate write and video sides
+ *
+ * CDL implementation of a module that takes SRAM writes into a
+ * framebuffer, including a mapping to a dual-port SRAM (write on one
+ * side, read on the other), where the video side uses a teletext
+ * decoder and drives out vsync, hsync, data enable and pixel data.
+ *
+ * The video side is asynchronous to the SRAM write side.
+ *
+ * The video output side has a programmable horizontal period that
+ * starts with hsync high for one clock, and then has a programmable
+ * back porch, followed by a programmable number of pixels (with data
+ * out enabled only if on the correct vertical portion of the display),
+ * followed by a programmable front porch, repeating.
+ *
+ * The video output side has a programmable vertical period that is in
+ * units of horizontal period; it starts with vsync high for one
+ * horizontal period, and then has a programmable front porch,
+ * followed by a programmable number of displayed lined, followed by a
+ * programmable front porch, repeating.
+ *
+ * The video output start at a programmable base address in SRAM;
+ * moving down a line adds a programmable amount to the address in
+ * SRAM.
+ */
+/*a Includes */
+include "apb::csr.h"
+include "std::sram.h"
+include "std::srams.h"
+include "video.h"
+include "teletext.h"
+
+include "apb::csr_targets.h"
+include "framebuffer_modules.h"
+
+/*a Constants */
+constant integer cfg_downsize_x=0;
+constant integer cfg_downsize_y=1;
+constant bit[16] csr_select_default = 0;
+
+/*a Types */
+/*t t_display_fsm */
+typedef fsm {
+    state_back_porch;
+    state_display;
+    state_front_porch;
+} t_display_fsm;
+
+/*t t_video_state */
+typedef struct {
+    bit[8] red;
+    bit[8] green;
+    bit[8] blue;
+} t_video_state;
+
+/*t t_pixel_combs */
+typedef struct {
+    bit[8] red;
+    bit[8] green;
+    bit[8] blue;
+    bit[5] next_num_valid;
+    bit[14] sram_address_next_line;
+    bit load_shift_register;
+    bit sram_request;
+    t_teletext_character tt_char;
+} t_pixel_combs;
+
+/*t t_pixel_shift_register */
+typedef struct {
+    bit[12] red;
+    bit[12] green;
+    bit[12] blue;
+} t_pixel_shift_register;
+
+/*t t_pixel_state */
+typedef struct {
+    bit[5] num_valid;
+    bit[14] sram_address;
+    bit[14] sram_address_line_start;
+    bit reading_sram;
+    bit data_buffer_full;
+    bit request_outstanding;
+    t_pixel_shift_register shift;
+    t_pixel_shift_register data_buffer;
+} t_pixel_state;
+
+/*t t_sram_state */
+typedef struct {
+    t_sram_access_req write_request;
+} t_sram_state;
+
+/*t t_video_csrs */
+typedef struct {
+    bit[10] h_back_porch;
+    bit[10] h_display;
+    bit[10] h_front_porch;
+    bit[10] v_back_porch;
+    bit[10] v_display;
+    bit[10] v_front_porch;
+} t_video_csrs;
+
+/*t t_csrs */
+typedef struct {
+    bit[16] sram_base_address;
+    bit[16] sram_words_per_line;
+} t_csrs;
+
+/*a Module
+ */
+module framebuffer_teletext( clock csr_clk "Clock for CSR reads/writes",
+                             clock sram_clk  "SRAM write clock, with frame buffer data",
+                             clock video_clk "Video clock, used to generate vsync, hsync, data out, etc",
+                             input bit reset_n,
+                             input t_sram_access_req display_sram_write,
+                             output t_video_bus video_bus,
+                             input bit[16] csr_select_in,
+                             input t_csr_request csr_request,
+                             output t_csr_response csr_response
+    )
+"""
+This module provides a teletext framebuffer of configurable size.
+
+Each character is 12x10 pixels - horizontally smoothed, but not vertically.
+
+This module incorporates a @a framebuffer_timing module which should
+be configured with the correct display size and porches; the
+csr_select used for this is 1 more than that used for this module
+itself.
+
+The module includes a CSR target with two registers: framebuffer start
+address (register 0), and SRAM words per line (register 1). The
+words-per-line register should be initialized to the number of
+characters in a line (i.e. displayed pixels/12). The framebuffer start
+register can be used to have multiple framebuffers, or to provide for
+scrolling, or it can be held at 0.
+"""
+{
+    /*b State etc in CSR domain */
+    default reset active_low reset_n;
+    default clock csr_clk;
+    clocked bit[16] csr_select = csr_select_default;
+    clocked t_csrs csrs = {*=0,
+                           sram_words_per_line=40
+    };
+    net t_csr_response     local_csr_response;
+    net t_csr_response     timing_csr_response "Pipelined CSR response interface to control the module";
+    net t_csr_access       csr_access;
+    comb t_csr_access_data csr_read_data;
+    net t_video_timing video_timing;
+
+    /*b State in SRAM domain */
+    default reset active_low reset_n;
+    default clock sram_clk;
+    clocked t_sram_state    sram_state={*=0};
+
+    /*b State in video domain */
+    default reset active_low reset_n;
+    default clock video_clk;
+    clocked t_teletext_timings tt_timings={*=0};
+    clocked t_video_state video_state={*=0};
+    clocked t_pixel_state pixel_state={*=0};
+    comb    t_pixel_combs pixel_combs;
+    net t_teletext_rom_access  tt_rom_access;
+    net bit[45]                tt_rom_data;
+    net t_teletext_pixels tt_pixels;
+    net bit[8] pixel_read_data;
+
+    /*b Video bus out */
+    video_bus_out """
+    Drive the video_bus out, and record the pixel value for that.
+    """ : {
+        video_bus.vsync = video_timing.v_sync;
+        video_bus.hsync = video_timing.h_sync;
+        video_bus.vs    = video_timing.vs;
+        video_bus.hs    = video_timing.hs;
+        video_bus.display_enable = video_timing.display_enable;
+        video_bus.red   = video_state.red;
+        video_bus.green = video_state.green;
+        video_bus.blue  = video_state.blue;
+
+        if (video_timing.will_display_enable) {
+            video_state.red   <= pixel_combs.red;
+            video_state.green <= pixel_combs.green;
+            video_state.blue  <= pixel_combs.blue;
+        }
+    }
+    
+    /*b Pixel data buffer, shift register, and sram request */
+    pixel_data_logic """
+    The pixel data shift register is consumed on
+    'video_timing.will_display_pixels' When it becomes empty, it
+    attempts to load from the pixel buffer.
+
+    The pixel data buffer is filled from the teletext output whenever
+    it is valid; this happens after a valid @a tt_char is presented to
+    the teletext module, which in turn happens after reading the frame
+    buffer, which again happens because the pixel data buffer is
+    empty.
+
+    """: {
+        /*b Pixel combinatorials */
+        pixel_combs.next_num_valid = pixel_state.num_valid - 1;
+        if (cfg_downsize_x) {
+            pixel_combs.next_num_valid = pixel_state.num_valid - 2;
+        }
+        if (pixel_state.num_valid==0) {
+            pixel_combs.next_num_valid = 0;
+        }
+        if (!video_timing.will_display_enable) {
+            pixel_combs.next_num_valid = pixel_state.num_valid;
+        }
+
+        pixel_combs.sram_address_next_line  = pixel_state.sram_address_line_start + csrs.sram_words_per_line[14;0];
+        pixel_combs.load_shift_register     = (pixel_state.data_buffer_full && (pixel_combs.next_num_valid==0));
+        pixel_combs.sram_request            = (video_timing.v_displaying &&
+                                               !video_timing.h_sync && // hold off start of line for 1 tick
+                                               !pixel_state.data_buffer_full &&
+                                               !pixel_state.request_outstanding);
+
+        pixel_combs.red   = 0;
+        pixel_combs.green = 0;
+        pixel_combs.blue  = 0;
+        if (pixel_state.shift.red  [11]) { pixel_combs.red   = -1; }
+        if (pixel_state.shift.green[11]) { pixel_combs.green = -1; }
+        if (pixel_state.shift.blue [11]) { pixel_combs.blue  = -1; }
+
+        pixel_combs.tt_char = {valid=pixel_state.reading_sram,
+                               character=pixel_read_data[7;0]};
+
+        /*b Pixel state */
+        pixel_state.reading_sram <= 0;
+        if (pixel_combs.sram_request) {
+            pixel_state.request_outstanding <= 1;
+            pixel_state.reading_sram <= 1;
+        }
+        if (tt_pixels.valid) {
+            pixel_state.request_outstanding <= 0;
+        }
+        if (video_timing.will_display_enable) {
+            pixel_state.shift.red  [11;1] <= pixel_state.shift.red  [11;0];
+            pixel_state.shift.green[11;1] <= pixel_state.shift.green[11;0];
+            pixel_state.shift.blue [11;1] <= pixel_state.shift.blue [11;0];
+            if (cfg_downsize_x) {
+                pixel_state.shift.red  [10;2] <= pixel_state.shift.red  [10;0];
+                pixel_state.shift.green[10;2] <= pixel_state.shift.green[10;0];
+                pixel_state.shift.blue [10;2] <= pixel_state.shift.blue [10;0];
+            }
+            pixel_state.num_valid <= pixel_combs.next_num_valid;
+        }
+        if (pixel_combs.load_shift_register) {
+            pixel_state.shift     <= pixel_state.data_buffer;
+            pixel_state.data_buffer_full <= 0;            
+            pixel_state.num_valid        <= 12;
+        }
+        if (tt_pixels.valid) {
+            pixel_state.data_buffer.red   <= tt_pixels.red;
+            pixel_state.data_buffer.green <= tt_pixels.green;
+            pixel_state.data_buffer.blue  <= tt_pixels.blue;
+            pixel_state.data_buffer_full <= 1;
+            pixel_state.sram_address <= pixel_state.sram_address+1;
+        }
+        if (video_timing.will_h_sync) {
+            pixel_state.data_buffer_full <= 0;            
+            pixel_state.num_valid        <= 0;
+            if (video_timing.v_displaying) {
+                pixel_state.sram_address            <= pixel_state.sram_address_line_start;
+                pixel_state.sram_address_line_start <= pixel_state.sram_address_line_start;
+                if (tt_pixels.last_scanline) {
+                    pixel_state.sram_address            <= pixel_combs.sram_address_next_line;
+                    pixel_state.sram_address_line_start <= pixel_combs.sram_address_next_line;
+                }
+            }
+            if (video_timing.v_frame_last_line) {
+                pixel_state.sram_address            <= csrs.sram_base_address[14;0];
+                pixel_state.sram_address_line_start <= csrs.sram_base_address[14;0];
+            }
+        }
+        /*b All done */
+    }
+
+    /*b SRAM write and SRAM instance */
+    sram_write_logic """
+    Take the SRAM write bus, register it, then write in the data
+    """: {
+        sram_state.write_request.valid <= 0;
+        if (display_sram_write.valid) {
+            sram_state.write_request <= display_sram_write;
+        }
+
+        se_sram_mrw_2_16384x8 display(sram_clock_0     <- sram_clk,
+                                       select_0         <= sram_state.write_request.valid,
+                                       read_not_write_0 <= 0,
+                                       address_0        <= sram_state.write_request.address[14;0],
+                                       write_data_0     <= sram_state.write_request.write_data[8;0],
+                                       // data_out_0 =>
+                                       
+                                       sram_clock_1     <- video_clk,
+                                       select_1         <= pixel_combs.sram_request,
+                                       read_not_write_1 <= 1,
+                                       address_1        <= pixel_state.sram_address[14;0],
+                                       write_data_1     <= 0,
+                                       data_out_1       => pixel_read_data );
+    }
+
+    /*b Teletext instance and its character ROM */
+    teletext_logic """
+    This is an instantiation of the teletext module, which takes a
+    character and scanline timings and presents pixel data out, after
+    a few cycles, using a character ROM (instantiated here).
+    """: {
+        tt_timings.interpolate_vertical  <= cfg_downsize_y ? tvi_even_scanlines : tvi_all_scanlines;
+        tt_timings.first_scanline_of_row <= 0;
+        tt_timings.end_of_scanline       <= video_timing.h_sync;
+        tt_timings.restart_frame         <= video_timing.v_sync;
+        tt_timings.smoothe               <= 1;
+        teletext tt( clk        <- video_clk,
+                     reset_n    <= reset_n,
+                     character  <= pixel_combs.tt_char,
+                     timings    <= tt_timings,
+                     rom_access => tt_rom_access,
+                     rom_data   <= tt_rom_data,
+                     pixels     => tt_pixels
+            );
+
+        se_sram_srw_128x45 character_rom(sram_clock     <- video_clk,
+                                         select         <= tt_rom_access.select,
+                                         read_not_write <= 1,
+                                         address        <= tt_rom_access.address,
+                                         write_data     <= 0,
+                                         data_out       => tt_rom_data );
+    }
+
+    /*b CSR interface */
+    csr_interface_logic """
+    Basic CSRS and frame buffer timing module
+    """: {
+        if (csr_select_in!=0) {
+            csr_select <= csr_select_in;
+        }
+
+        csr_target_csr csri( clk <- csr_clk,
+                                reset_n <= reset_n,
+                                csr_request <= csr_request,
+                                csr_response => local_csr_response,
+                                csr_access => csr_access,
+                                csr_access_data <= csr_read_data,
+                             csr_select <= csr_select );
+
+        framebuffer_timing fbt(csr_clk <- csr_clk,
+                                  video_clk <- video_clk,
+                                  reset_n <= reset_n,
+                                  video_timing => video_timing,
+                                  csr_request <= csr_request,
+                                  csr_response => timing_csr_response,
+                                  csr_select <= csr_select+1 );
+        
+        csr_response = local_csr_response;
+        csr_response |= timing_csr_response;
+        csrs <= csrs;
+        if (csr_access.valid && !csr_access.read_not_write) {
+            part_switch (csr_access.address[4;0]) {
+            case 0: { csrs.sram_base_address   <= csr_access.data[16;0]; }
+            case 1: { csrs.sram_words_per_line <= csr_access.data[16;0]; }
+            }
+        }
+        csr_read_data = 0;
+    }
+
+    /*b All done */
+}
