@@ -1,0 +1,3 @@
+smoke:
+	${SIM} smoke.csm
+

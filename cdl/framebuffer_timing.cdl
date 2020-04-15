@@ -21,6 +21,7 @@
  *
  */
 /*a Includes */
+include "std::tech_sync.h"
 include "apb::csr.h"
 include "apb::csr_targets.h"
 include "video.h"
@@ -75,6 +76,8 @@ typedef struct {
     bit v_displaying;
 
     bit will_display_pixels;
+
+    bit restart_timing "Asserted if timing should be reset back to 0 - really for sim";
 } t_video_combs;
 
 /*t t_video_state
@@ -96,6 +99,7 @@ typedef struct {
 
     bit pixel_data_required;
 
+    bit last_valid_toggle "Used to determine reset of frame counters on CSR write";
 } t_video_state;
 
 /*t t_csrs
@@ -113,6 +117,8 @@ typedef struct {
     t_timing h_strobe_length   "Number of scanlines to assert hs for";
     bit      v_strobe_polarity "If high the vs is active high; if low, then active low";
     t_timing v_strobe_length   "Number of scanlines to assert hs for";
+
+    bit state_changed_toggle   "Toggled on every CSR write so video can reset";
 } t_csrs;
 
 /*a Module
@@ -194,6 +200,7 @@ Bits     | Meaning
     default clock video_clk;
     clocked t_video_state video_state={*=0}    "State of the video side; timing counters, state machines, and outputs";
     comb    t_video_combs video_combs          "Combinatorial decode of the @a video_state";
+    net bit video_clk_state_changed_toggle_sync "Synchronizer output";
 
     /*b Video timing logic */
     video_timing_logic """
@@ -213,6 +220,14 @@ Bits     | Meaning
     back porch, display, front porch. The display is enabled if in the
     display state for both horizontal and vertical timing machines.
     """: {
+        /*b Determine restarting timing */
+        tech_sync_bit restart_timing_toggle_sync(clk <- video_clk,
+                                                 reset_n <= reset_n,
+                                                 d <= csrs.state_changed_toggle,
+                                                 q => video_clk_state_changed_toggle_sync );
+        video_state.last_valid_toggle <= video_clk_state_changed_toggle_sync;
+        video_combs.restart_timing = video_clk_state_changed_toggle_sync != video_state.last_valid_toggle;
+        
         /*b Timing decode */
         video_combs.h_line_start     = video_state.h_sync;
         video_combs.h_back_porch_end = ((video_state.h_state==state_back_porch)  && (video_state.h_pixel==csrs.h_back_porch));
@@ -313,7 +328,11 @@ Bits     | Meaning
             video_state.vs <= 0;
             video_state.vs_counter <= csrs.v_strobe_length;
         }
-        
+
+        if (video_combs.restart_timing) {
+            video_state.v_line <= 0;
+            video_state.h_pixel <= 0;
+        }
         /*b All done */
     }
 
@@ -349,6 +368,10 @@ Bits     | Meaning
                                 csr_select <= csr_select );
         csrs <= csrs;
         csr_read_data = 0;
+        if (csr_access.valid && !csr_access.read_not_write) {
+            csrs.state_changed_toggle <= !csrs.state_changed_toggle;
+        }
+        
         part_switch (csr_access.address[4;0]) {
         case csr_address_display_size: {
             csr_read_data[timing_width;  0] = csrs.h_display;

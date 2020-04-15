@@ -27,10 +27,10 @@
  */
 /*a Includes */
 include "apb::csr.h"
-include "video.h"
+include "video::video.h"
 include "apb::csr_targets.h"
 include "std::srams.h"
-include "framebuffer_modules.h"
+include "video::framebuffer_modules.h"
 
 /*a Types */
 /*t t_csr_address

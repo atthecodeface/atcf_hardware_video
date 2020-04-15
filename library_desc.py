@@ -1,13 +1,18 @@
 import cdl_desc
 from cdl_desc import CdlModule, CModel
 
+class Library(cdl_desc.Library):
+    name="video"
+    pass
+
 class TeletextModules(cdl_desc.Modules):
     name = "teletext"
     c_src_dir   = "cmodel"
     src_dir     = "cdl"
     tb_src_dir  = "tb_cdl"
     include_dir = "cdl"
-    libraries = ["apb", "std"]
+    libraries = {"apb":True, "std":True}
+    export_dirs = [ src_dir, include_dir ]
     modules = []
     # saa5050 needs t_bbc_micro_sram_request
     # modules += [ CdlModule("saa5050") ]
@@ -44,11 +49,11 @@ class FramebufferModules(cdl_desc.Modules):
     src_dir     = "cdl"
     tb_src_dir  = "tb_cdl"
     include_dir = "cdl"
-    libraries = ["apb", "std"]
+    libraries = {"apb":True, "std":True}
+    export_dirs = [ src_dir, include_dir ]
     modules = []
     modules += [ FramebufferTimingCdl("framebuffer_timing") ]
     modules += [ FramebufferTeletextCdl("framebuffer_teletext") ]
     modules += [ CdlModule("framebuffer") ]
+    modules += [ CdlModule("tb_framebuffer_timing", src_dir=tb_src_dir) ]
     pass
-
-modules=cdl_desc.Modules.__subclasses__

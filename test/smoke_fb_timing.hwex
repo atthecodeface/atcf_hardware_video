@@ -1,0 +1,30 @@
+#a Copyright
+#  
+#  This file 'smoke_dprintf.hwex' copyright Gavin J Stark 2020
+#  
+#  This program is free software; you can redistribute it and/or modify it under
+#  the terms of the GNU General Public License as published by the Free Software
+#  Foundation, version 2.0.
+#  
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even implied warranty of MERCHANTABILITY
+#  or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License
+#  for more details.
+
+printf "Regression smoke test %s0% test_ctl %d1%" env_string("test_harness")  env_int("test_ctl")
+
+module_force_option_string "tb.th" "clock" clk
+module_force_option_string "tb.th" "inputs" "csr_response__read_data[32] csr_response__read_data_error csr_response__read_data_valid csr_response__acknowledge video_timing__hs video_timing__vs video_timing__v_frame_last_line video_timing__display_enable video_timing__will_display_enable video_timing__display_required video_timing__v_displaying video_timing__will_h_sync video_timing__h_sync video_timing__v_sync"
+module_force_option_string "tb.th" "outputs" "csr_request__data[32] csr_request__address[16] csr_request__select[16] csr_request__read_not_write csr_request__valid display_sram_write__write_data[64] display_sram_write__address[32] display_sram_write__byte_enable[8] display_sram_write__read_not_write display_sram_write__id[8] display_sram_write__valid"
+module_force_option_string "tb.th" "filename" env_string("test_harness")
+module tb_framebuffer_timing tb
+
+clock system_clock   0 2 2
+wire reset_n
+assign reset_n 0 10 1
+    
+drive tb.clk        system_clock
+drive tb.reset_n    reset_n
+
+end
+

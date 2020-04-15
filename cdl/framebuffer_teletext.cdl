@@ -40,10 +40,10 @@
  */
 /*a Includes */
 include "apb::csr.h"
-include "std::sram.h"
+// include "std::sram.h"
 include "std::srams.h"
-include "video.h"
-include "teletext.h"
+include "video::video.h"
+include "video::teletext.h"
 
 include "apb::csr_targets.h"
 include "framebuffer_modules.h"

@@ -1,0 +1,170 @@
+int vector_number
+string failure_reason
+
+
+int frame_start
+int frame_time
+int display_enable_count
+int h_sync_count
+int v_displaying_count
+int v_sync_count
+int vs_was_high
+
+
+bfm_wait 10
+
+# 16 wide 9 high
+csr_request__data.drive 0x8000f
+csr_request__address.drive 0
+csr_request__select.drive 0x1234
+
+gosub do_write
+
+csr_request__data.drive 0x30002
+csr_request__address.drive 1
+csr_request__select.drive 0x1234
+
+gosub do_write
+
+csr_request__data.drive 0x10004
+csr_request__address.drive 2
+csr_request__select.drive 0x1234
+
+gosub do_write
+
+csr_request__data.drive 0x10002
+csr_request__address.drive 3
+csr_request__select.drive 0x1234
+
+gosub do_write
+
+csr_request__data.drive 0
+csr_request__address.drive 0
+csr_request__select.drive 0x1234
+
+gosub do_read
+
+int ticks_per_clock
+set ticks_per_clock global_cycle()
+bfm_wait 1
+sub ticks_per_clock global_cycle() ticks_per_clock
+
+video_timing__vs.wait_for_value 0 20000
+video_timing__vs.wait_for_value 1 20000
+video_timing__vs.wait_for_value 0 20000
+video_timing__vs.wait_for_value 1 20000
+
+gosub time_frame
+
+# 1 hsync per (v lines + v porches) = 9+2+5 = 16
+# 1 vsync per frame of (h pixels + h porches) = 16+4+3 = 23
+# display enable = h pixels * v linex = 144
+# frame time = (v lines + v porches) * (h pixels + h porches) * global clocks / cycle = 16*23*ticks_per_clock
+printf "%d0% Frame %d1% ticks h_sync %d2% v_sync %d3% display_enable %d4% " global_cycle() frame_time h_sync_count v_sync_count display_enable_count
+
+set_string failure_reason "h sync count did not match #vertical lines in display and porches"
+bne h_sync_count 16 test_fail
+
+set_string failure_reason "v sync time did not match #horizontal pixels in line with porches"
+bne v_sync_count 23 test_fail
+
+set_string failure_reason "display enable did not equal number of display pixels (h * v)"
+bne display_enable_count 144 test_fail
+
+set_string failure_reason "frame time did not match (v lines + v porches) * (h pixels + h porches) * global clocks / cycle"
+int temp
+mult temp ticks_per_clock 368
+bne frame_time temp test_fail
+
+pass global_cycle() "Test succeeded"
+
+end
+
+time_frame:
+set frame_start global_cycle()
+set display_enable_count 0
+set h_sync_count 0
+set v_displaying_count 0
+set v_sync_count 0
+set vs_was_high 1
+
+tf_loop:
+beq video_timing__display_enable.value() 0 nt_display_enable
+add display_enable_count display_enable_count 1
+nt_display_enable:
+
+beq video_timing__h_sync.value() 0 nt_h_sync
+add h_sync_count h_sync_count 1
+nt_h_sync:
+
+beq video_timing__v_sync.value() 0 nt_v_sync
+add v_sync_count v_sync_count 1
+nt_v_sync:
+
+beq video_timing__v_displaying.value() 0 nt_v_displaying
+add v_displaying_count v_displaying_count 1
+nt_v_displaying:
+
+bne video_timing__vs.value() 1 nt_vs
+# VS is now high
+beq vs_was_high 0 frame_over
+nt_vs:
+
+bne video_timing__vs.value() 0 nt_vs_low
+# VS is now low - must be a long way in to frame
+set vs_was_high 0
+nt_vs_low:
+
+bfm_wait 1
+goto tf_loop
+
+frame_over:
+sub frame_time global_cycle() frame_start
+return
+
+
+
+do_write:
+csr_request__read_not_write.drive 0
+csr_request__valid.drive 1
+beq csr_response__acknowledge.value() 1 requested
+csr_response__acknowledge.wait_for_value 1 200000
+beq csr_response__acknowledge.value() 1 requested
+set_string failure_reason "timeout on CSR acknowledge"
+goto test_fail
+
+requested:
+csr_request__valid.drive 0
+bfm_wait 1
+return
+
+do_read:
+csr_request__read_not_write.drive 1
+csr_request__valid.drive 1
+beq csr_response__acknowledge.value() 1 read_requested
+csr_response__acknowledge.wait_for_value 1 200000
+beq csr_response__acknowledge.value() 1 read_requested
+set_string failure_reason "timeout on CSR acknowledge"
+goto test_fail
+
+read_requested:
+csr_request__valid.drive 0
+bfm_wait 1
+beq csr_response__read_data_valid.value() 1 read_data_valid
+csr_response__read_data_valid.wait_for_value 1 200000
+beq csr_response__read_data_valid.value() 1 read_data_valid
+set_string failure_reason "timeout after CSR ack for read data"
+goto test_fail
+read_data_valid:
+
+return
+
+
+test_fail:
+printf "Test failed, cycle %d0%, reason %d1%" global_cycle() 0
+sprintf failure_reason "**************************************************************************** Test failed : %s0%" failure_reason
+fail vector_number failure_reason
+end
+
+
+
