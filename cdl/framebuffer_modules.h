@@ -21,8 +21,8 @@
 
 /*a Includes */
 include "apb::csr.h"
-include "video::teletext.h"
-include "video::video.h"
+include "teletext.h"
+include "video.h"
 
 /*a Modules */
 /*m framebuffer_timing */
