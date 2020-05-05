@@ -1,3 +1,5 @@
+Q=@
+
 smoke:
-	${SIM} smoke.csm
+	${Q}${SIM} smoke.csm
 
