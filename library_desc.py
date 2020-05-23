@@ -10,9 +10,9 @@ class TeletextModules(cdl_desc.Modules):
     c_src_dir   = "cmodel"
     src_dir     = "cdl"
     tb_src_dir  = "tb_cdl"
-    include_dir = "cdl"
     libraries = {"apb":True, "std":True}
-    export_dirs = [ src_dir, include_dir ]
+    cdl_include_dirs = ["cdl"]
+    export_dirs      = cdl_include_dirs + [ src_dir ]
     modules = []
     # saa5050 needs t_bbc_micro_sram_request
     # modules += [ CdlModule("saa5050") ]
@@ -48,9 +48,9 @@ class FramebufferModules(cdl_desc.Modules):
     c_src_dir   = "cmodel"
     src_dir     = "cdl"
     tb_src_dir  = "tb_cdl"
-    include_dir = "cdl"
     libraries = {"apb":True, "std":True}
-    export_dirs = [ src_dir, include_dir ]
+    cdl_include_dirs = ["cdl"]
+    export_dirs      = cdl_include_dirs + [ src_dir ]
     modules = []
     modules += [ FramebufferTimingCdl("framebuffer_timing") ]
     modules += [ FramebufferTeletextCdl("framebuffer_teletext") ]
