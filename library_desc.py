@@ -48,7 +48,7 @@ class FramebufferModules(cdl_desc.Modules):
     c_src_dir   = "cmodel"
     src_dir     = "cdl"
     tb_src_dir  = "tb_cdl"
-    libraries = {"apb":True, "std":True}
+    libraries = {"apb":True, "std":True, "utils":True}
     cdl_include_dirs = ["cdl"]
     export_dirs      = cdl_include_dirs + [ src_dir ]
     modules = []

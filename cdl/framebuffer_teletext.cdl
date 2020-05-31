@@ -40,8 +40,8 @@
  */
 /*a Includes */
 include "apb::csr.h"
-// include "std::sram.h"
 include "std::srams.h"
+include "utils::sram_access.h"
 include "video::video.h"
 include "video::teletext.h"
 

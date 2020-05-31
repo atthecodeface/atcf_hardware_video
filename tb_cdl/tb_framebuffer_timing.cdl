@@ -19,6 +19,7 @@
  */
 /*a Includes */
 include "video::framebuffer_modules.h"
+include "utils::sram_access.h"
 
 /*a External modules */
 extern module se_test_harness( clock clk "Clock for CSR reads/writes",

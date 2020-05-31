@@ -18,6 +18,7 @@
  * This is a simple testbench for the teletext decoder.
  */
 /*a Includes */
+include "utils::sram_access.h"
 include "srams.h"
 include "types/teletext.h"
 include "video/framebuffer_modules.h"

@@ -21,6 +21,7 @@
 
 /*a Includes */
 include "apb::csr.h"
+include "utils::sram_access.h"
 include "teletext.h"
 include "video.h"
 
